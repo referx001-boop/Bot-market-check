@@ -1,0 +1,13 @@
+{
+  "name": "bot-market-check",
+  "version": "1.0.0",
+  "description": "Bybit market health checker with dashboard",
+  "main": "market-check.js",
+  "scripts": {
+    "start": "node market-check.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
