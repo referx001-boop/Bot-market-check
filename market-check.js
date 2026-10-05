@@ -2,14 +2,15 @@
 // Run once:      node market-check.js
 // Run on loop:   INTERVAL_MIN=15 node market-check.js
 // Telegram:      TG_TOKEN=xxx TG_CHAT=123 (alerts only when the verdict changes)
-// Web (Render):  PORT=3000 serves the latest report as JSON at /
+// Dashboard:     PORT=3000 serves the dashboard at / and JSON at /api
+//                (refreshes every 5 min unless INTERVAL_MIN is set)
 
 const http = require("http");
 
 const API = "https://api.bybit.com";
 const TOP_N = +process.env.TOP_N || 30;
-const INTERVAL_MIN = +process.env.INTERVAL_MIN || 0;
 const { TG_TOKEN, TG_CHAT, PORT } = process.env;
+const INTERVAL_MIN = +process.env.INTERVAL_MIN || (PORT ? 5 : 0);
 
 async function get(path) {
   const res = await fetch(API + path);
@@ -100,6 +101,13 @@ async function check() {
       return null;
     }
   });
+  const coins = tickers.map((t, i) => ({
+    symbol: t.symbol,
+    price: +t.lastPrice,
+    chg24: +((+t.price24hPcnt || 0) * 100).toFixed(2),
+    fundingPct: +((+t.fundingRate || 0) * 100).toFixed(4),
+    aboveEma50: above[i],
+  }));
   const valid = above.filter((x) => x !== null);
   const breadth = (valid.filter(Boolean).length / valid.length) * 100;
 
@@ -140,6 +148,7 @@ async function check() {
     btcAtrPct: +atr.toFixed(2),
     avgFundingPct: +(funding * 100).toFixed(4),
     flags,
+    coins,
   };
 }
 
@@ -167,12 +176,15 @@ async function telegram(text) {
 
 let latest = null;
 let lastVerdict = null;
+const history = [];
 
 async function run() {
   try {
     latest = await check();
     console.log(format(latest) + "\n");
     if (latest.verdict !== lastVerdict) {
+      history.unshift({ time: latest.time, verdict: latest.verdict, score: latest.score });
+      if (history.length > 20) history.pop();
       await telegram(format(latest));
       lastVerdict = latest.verdict;
     }
@@ -181,13 +193,92 @@ async function run() {
   }
 }
 
+const PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bybit Market Check</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--line:#262d36;--text:#e6edf3;--mute:#8b949e;--long:#2ea043;--short:#f85149;--mixed:#d29922;--bad:#6e7681}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,sans-serif;padding:16px;max-width:900px;margin:auto}
+h1{font-size:15px;color:var(--mute);font-weight:500;margin:0 0 12px;display:flex;justify-content:space-between}
+.hero{border-radius:10px;padding:20px;text-align:center;border:1px solid var(--line);background:var(--card)}
+.hero .v{font-size:26px;font-weight:700}
+.hero .s{color:var(--mute);margin-top:6px}
+.long{border-color:var(--long);color:var(--long)}.short{border-color:var(--short);color:var(--short)}
+.mixed{border-color:var(--mixed);color:var(--mixed)}.bad{border-color:var(--bad);color:var(--mute)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:12px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px}
+.card .l{color:var(--mute);font-size:12px}.card .n{font-size:18px;font-weight:600;margin-top:4px}
+.up{color:var(--long)}.down{color:var(--short)}
+.flags{margin:0 0 12px;display:flex;gap:8px;flex-wrap:wrap}
+.flag{background:#3b2f10;color:var(--mixed);border-radius:6px;padding:4px 8px;font-size:12px}
+h2{font-size:13px;color:var(--mute);font-weight:500;margin:18px 0 8px}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+th,td{padding:8px 10px;text-align:right;border-bottom:1px solid var(--line)}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--mute);font-weight:500;font-size:12px}
+.wrap{overflow-x:auto}
+.hist div{padding:6px 0;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:10px}
+.hist span:last-child{color:var(--mute);white-space:nowrap}
+</style></head><body>
+<h1><span>Bybit Market Check</span><span id="time">loading</span></h1>
+<div id="hero" class="hero bad"><div class="v" id="verdict">Loading</div><div class="s" id="score"></div></div>
+<div class="grid" id="metrics"></div>
+<div class="flags" id="flags"></div>
+<h2>Top coins by volume</h2>
+<div class="wrap"><table><thead><tr><th>Symbol</th><th>Price</th><th>24h</th><th>1h EMA50</th><th>Funding</th></tr></thead><tbody id="coins"></tbody></table></div>
+<h2>Verdict history</h2>
+<div class="hist" id="hist"></div>
+<script>
+var $=function(i){return document.getElementById(i)};
+function cls(v){return v.indexOf("GOOD for LONGS")===0?"long":v.indexOf("GOOD for SHORTS")===0?"short":v.indexOf("NOT")===0?"bad":"mixed"}
+function trendCls(t){return t==="up"?"up":t==="down"?"down":""}
+function card(l,n,c){return '<div class="card"><div class="l">'+l+'</div><div class="n '+(c||"")+'">'+n+'</div></div>'}
+function load(){
+  fetch("/api").then(function(r){return r.json()}).then(function(d){
+    var r=d.latest;
+    if(!r){$("verdict").textContent="Starting, first check running";return}
+    $("hero").className="hero "+cls(r.verdict);
+    $("verdict").textContent=r.verdict;
+    $("score").textContent="Score "+r.score+" of 5 (negative means bearish)";
+    $("time").textContent="Updated "+new Date(r.time).toLocaleTimeString();
+    $("metrics").innerHTML=
+      card("BTC 4h trend",r.btc4hTrend,trendCls(r.btc4hTrend))+
+      card("BTC 1h trend",r.btc1hTrend,trendCls(r.btc1hTrend))+
+      card("Above 1h EMA50",r.breadthAboveEma50Pct+"%",r.breadthAboveEma50Pct>=55?"up":r.breadthAboveEma50Pct<=45?"down":"")+
+      card("Green on 24h",r.green24hPct+"%")+
+      card("BTC efficiency",r.btcEfficiency,r.btcEfficiency<0.25?"down":"")+
+      card("BTC ATR",r.btcAtrPct+"%")+
+      card("Avg funding",r.avgFundingPct+"%");
+    $("flags").innerHTML=r.flags.map(function(f){return '<span class="flag">'+f+'</span>'}).join("");
+    $("coins").innerHTML=r.coins.map(function(c){
+      var e=c.aboveEma50===null?"n/a":c.aboveEma50?"above":"below";
+      return '<tr><td>'+c.symbol.replace("USDT","")+'</td><td>'+c.price+'</td><td class="'+(c.chg24>=0?"up":"down")+'">'+c.chg24+'%</td><td class="'+(e==="above"?"up":e==="below"?"down":"")+'">'+e+'</td><td>'+c.fundingPct+'%</td></tr>';
+    }).join("");
+    $("hist").innerHTML=d.history.map(function(h){
+      return '<div><span>'+h.verdict+' ('+h.score+')</span><span>'+new Date(h.time).toLocaleString()+'</span></div>';
+    }).join("");
+  }).catch(function(){$("time").textContent="connection lost"});
+}
+load();setInterval(load,30000);
+</script></body></html>`;
+
 if (PORT) {
   http
     .createServer((req, res) => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(latest || { status: "starting" }));
+      if (req.url === "/api") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ latest, history }));
+      } else if (req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("ok");
+      } else {
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(PAGE);
+      }
     })
-    .listen(PORT, () => console.log(`Serving on ${PORT}`));
+    .listen(PORT, () => console.log(`Dashboard on port ${PORT}`));
 }
 
 run();
